@@ -1,11 +1,13 @@
 import torch
-from torch_geometric.datasets import WikipediaNetwork, Planetoid
+from torch_geometric.datasets import WikipediaNetwork, Coauthor
 import pickle
 from torch_geometric.nn import GATConv
 import torch.nn.functional as F
 import os
 import matplotlib.pyplot as plt
 from datetime import datetime
+from torch_geometric.data import Data
+import numpy as np
 
 # 确保 ./data 目录存在
 data_dir = './data'
@@ -15,23 +17,67 @@ os.makedirs(data_dir, exist_ok=True)
 squirrel_dataset = WikipediaNetwork(root=os.path.join(data_dir, 'Squirrel'), name='Squirrel')
 squirrel_data = squirrel_dataset[0]
 
-# 加载Cora数据集并保存在指定目录
-cora_dataset = Planetoid(root=os.path.join(data_dir, 'Cora'), name='Cora')
-cora_data = cora_dataset[0]
+# 加载Coauthor CS数据集并保存在指定目录
+coauthor_dataset = Coauthor(root=os.path.join(data_dir, 'CoauthorCS'), name='CS')
+coauthor_data = coauthor_dataset[0]
 
 # 保存数据集到 ./data 目录
 with open(os.path.join(data_dir, 'squirrel_data.pkl'), 'wb') as f:
     pickle.dump(squirrel_data, f)
 
-with open(os.path.join(data_dir, 'cora_data.pkl'), 'wb') as f:
-    pickle.dump(cora_data, f)
+with open(os.path.join(data_dir, 'coauthor_data.pkl'), 'wb') as f:
+    pickle.dump(coauthor_data, f)
 
 # 从 ./data 目录加载数据集
-with open(os.path.join(data_dir, 'cora_data.pkl'), 'rb') as f:
-    loaded_cora_data = pickle.load(f)
+with open(os.path.join(data_dir, 'squirrel_data.pkl'), 'rb') as f:
+    loaded_squirrel_data = pickle.load(f)
+
+with open(os.path.join(data_dir, 'coauthor_data.pkl'), 'rb') as f:
+    loaded_coauthor_data = pickle.load(f)
+
+
+# 为 CoauthorCS 数据集添加 train_mask, val_mask 和 test_mask
+def add_masks(data, train_ratio=0.6, val_ratio=0.2):
+    num_nodes = data.y.shape[0]
+    indices = np.arange(num_nodes)
+    np.random.shuffle(indices)
+
+    train_size = int(train_ratio * num_nodes)
+    val_size = int(val_ratio * num_nodes)
+
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size:train_size + val_size]
+    test_indices = indices[train_size + val_size:]
+
+    train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+
+    train_mask[train_indices] = True
+    val_mask[val_indices] = True
+    test_mask[test_indices] = True
+
+    data.train_mask = train_mask
+    data.val_mask = val_mask
+    data.test_mask = test_mask
+
+
+# 添加 CoauthorCS 数据集掩码
+add_masks(loaded_coauthor_data)
+
+
+# 修正 Squirrel 数据集的掩码
+def select_first_task_mask(data):
+    data.train_mask = data.train_mask[:, 0]
+    data.val_mask = data.val_mask[:, 0]
+    data.test_mask = data.test_mask[:, 0]
+
+
+select_first_task_mask(loaded_squirrel_data)
 
 # 验证加载的数据是否正确
-print(loaded_cora_data)
+print(loaded_squirrel_data)
+print(loaded_coauthor_data)
 
 
 # 定义 GAT 模型
@@ -51,26 +97,47 @@ class GAT(torch.nn.Module):
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  # 设置设备为 GPU 或 CPU
 
-
-def train(data, model, optimizer):
-    model.train()  # 设置模型为训练模式
-    optimizer.zero_grad()  # 清空梯度
-    out = model(data.x.to(device), data.edge_index.to(device))  # 模型前向传播
-    train_mask = data.train_mask  # 获取训练掩码
-    loss = F.nll_loss(out[train_mask], data.y[train_mask].to(device))  # 计算损失
-    loss.backward()  # 反向传播
-    optimizer.step()  # 更新模型参数
-    return loss.item()  # 返回损失值
+# 定义小批次训练的数据加载器
+from torch_geometric.loader import DataLoader
 
 
-def test(data, model):
-    model.eval()  # 设置模型为评估模式
-    logits, accs = model(data.x.to(device), data.edge_index.to(device)), []  # 模型前向传播
-    for _, mask in data('train_mask', 'val_mask', 'test_mask'):  # 遍历训练、验证和测试掩码
-        pred = logits[mask].max(1)[1]  # 预测类别
-        acc = pred.eq(data.y[mask]).sum().item() / mask.sum().item()  # 计算准确率
-        accs.append(acc)  # 保存准确率
-    return accs  # 返回准确率
+def create_data_loader(data, batch_size=32):
+    dataset = [data]  # Assuming each dataset is loaded as a single graph
+    return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+
+coauthor_loader = create_data_loader(loaded_coauthor_data)
+squirrel_loader = create_data_loader(loaded_squirrel_data)
+
+
+# 训练函数
+def train_batch(loader, model, optimizer):
+    model.train()
+    total_loss = 0
+    for data in loader:
+        data = data.to(device)
+        optimizer.zero_grad()
+        out = model(data.x, data.edge_index)
+        loss = F.nll_loss(out[data.train_mask], data.y[data.train_mask])
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * data.num_graphs
+    return total_loss / len(loader.dataset)
+
+
+# 测试函数
+def test_batch(loader, model):
+    model.eval()
+    total_correct = 0
+    total_examples = 0
+    with torch.no_grad():
+        for data in loader:
+            data = data.to(device)
+            out = model(data.x, data.edge_index)
+            pred = out.argmax(dim=1)
+            total_correct += int((pred[data.test_mask] == data.y[data.test_mask]).sum())
+            total_examples += int(data.test_mask.sum())
+    return total_correct / total_examples
 
 
 # 准备绘图目录
@@ -85,57 +152,66 @@ os.makedirs(model_dir, exist_ok=True)
 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
 # 存储损失和准确率
-losses = []
-train_accs = []
-val_accs = []
-test_accs = []
+coauthor_losses = []
+coauthor_accs = []
+squirrel_losses = []
+squirrel_accs = []
 
-# 使用加载的数据集进行训练和测试
-model = GAT(loaded_cora_data.num_node_features, cora_dataset.num_classes).to(device)  # 初始化模型
-optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=5e-4)  # 初始化优化器
+# 初始化模型和优化器
+coauthor_model = GAT(loaded_coauthor_data.num_node_features, coauthor_dataset.num_classes).to(device)
+squirrel_model = GAT(loaded_squirrel_data.num_node_features, squirrel_dataset.num_classes).to(device)
 
-# 训练和测试
+coauthor_optimizer = torch.optim.Adam(coauthor_model.parameters(), lr=0.005, weight_decay=5e-4)
+squirrel_optimizer = torch.optim.Adam(squirrel_model.parameters(), lr=0.005, weight_decay=5e-4)
+
+# 训练和测试循环
 for epoch in range(200):
-    loss = train(loaded_cora_data, model, optimizer)  # 训练模型
-    train_acc, val_acc, test_acc = test(loaded_cora_data, model)  # 测试模型
+    coauthor_loss = train_batch(coauthor_loader, coauthor_model, coauthor_optimizer)
+    squirrel_loss = train_batch(squirrel_loader, squirrel_model, squirrel_optimizer)
 
-    # 存储每个epoch的损失和准确率
-    losses.append(loss)
-    train_accs.append(train_acc)
-    val_accs.append(val_acc)
-    test_accs.append(test_acc)
+    coauthor_acc = test_batch(coauthor_loader, coauthor_model)
+    squirrel_acc = test_batch(squirrel_loader, squirrel_model)
 
-    print(f'Epoch {epoch + 1}, Loss: {loss:.4f}, Val Acc: {val_acc:.4f}, Test Acc: {test_acc:.4f}')
+    coauthor_losses.append(coauthor_loss)
+    coauthor_accs.append(coauthor_acc)
+    squirrel_losses.append(squirrel_loss)
+    squirrel_accs.append(squirrel_acc)
+
+    print(f'Epoch {epoch + 1}, Coauthor Loss: {coauthor_loss:.4f}, Coauthor Acc: {coauthor_acc:.4f}')
+    print(f'Epoch {epoch + 1}, Squirrel Loss: {squirrel_loss:.4f}, Squirrel Acc: {squirrel_acc:.4f}')
 
     # 保存模型
-    model_path = os.path.join(model_dir, f'gat_model_epoch_{epoch + 1}_{timestamp}.pth')
-    torch.save(model.state_dict(), model_path)
+    coauthor_model_path = os.path.join(model_dir, f'coauthor_gat_model_epoch_{epoch + 1}_{timestamp}.pth')
+    squirrel_model_path = os.path.join(model_dir, f'squirrel_gat_model_epoch_{epoch + 1}_{timestamp}.pth')
+    torch.save(coauthor_model.state_dict(), coauthor_model_path)
+    torch.save(squirrel_model.state_dict(), squirrel_model_path)
 
 # 绘制并保存损失曲线和准确率曲线
-loss_plot_path = os.path.join(plot_dir, f'loss_plot_{timestamp}.png')
-acc_plot_path = os.path.join(plot_dir, f'acc_plot_{timestamp}.png')
+coauthor_loss_plot_path = os.path.join(plot_dir, f'coauthor_loss_plot_{timestamp}.png')
+squirrel_loss_plot_path = os.path.join(plot_dir, f'squirrel_loss_plot_{timestamp}.png')
+coauthor_acc_plot_path = os.path.join(plot_dir, f'coauthor_acc_plot_{timestamp}.png')
+squirrel_acc_plot_path = os.path.join(plot_dir, f'squirrel_acc_plot_{timestamp}.png')
 
 # 绘制损失曲线
 plt.figure()
-plt.plot(range(1, 201), losses, label='Loss')  # 绘制损失曲线
+plt.plot(range(1, 201), coauthor_losses, label='Coauthor Loss')
+plt.plot(range(1, 201), squirrel_losses, label='Squirrel Loss')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
 plt.title('Training Loss')
 plt.legend()
-plt.savefig(loss_plot_path)  # 保存损失曲线图
+plt.savefig(coauthor_loss_plot_path)
+plt.savefig(squirrel_loss_plot_path)
 plt.close()
 
 # 绘制准确率曲线
 plt.figure()
-plt.plot(range(1, 201), train_accs, label='Train Acc')  # 绘制训练准确率曲线
-plt.plot(range(1, 201), val_accs, label='Val Acc')  # 绘制验证准确率曲线
-plt.plot(range(1, 201), test_accs, label='Test Acc')  # 绘制测试准确率曲线
+plt.plot(range(1, 201), coauthor_accs, label='Coauthor Acc')
+plt.plot(range(1, 201), squirrel_accs, label='Squirrel Acc')
 plt.xlabel('Epoch')
 plt.ylabel('Accuracy')
-plt.title('Accuracy')
+plt.title('Training Accuracy')
 plt.legend()
-plt.savefig(acc_plot_path)  # 保存准确率曲线图
+plt.savefig(coauthor_acc_plot_path)
+plt.savefig(squirrel_acc_plot_path)
 plt.close()
-
-print(f"Loss plot saved to {loss_plot_path}")
-print(f"Accuracy plot saved to {acc_plot_path}")
